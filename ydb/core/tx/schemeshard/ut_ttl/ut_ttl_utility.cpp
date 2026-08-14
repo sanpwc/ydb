@@ -1,6 +1,9 @@
 #include <ydb/core/tx/schemeshard/common/validation.h>
 #include <ydb/core/tx/schemeshard/schemeshard_info_types.h>
 
+#include <ydb/core/protos/s3_settings.pb.h>
+#include <ydb/core/protos/tx_datashard.pb.h>
+
 #include <library/cpp/testing/unittest/registar.h>
 
 using namespace NKikimr;
@@ -87,14 +90,44 @@ Y_UNIT_TEST_SUITE(TSchemeShardTTLUtility) {
             NKikimrSchemeOp::TTTLSettings::TEnabled input;
             *input.AddTiers() = evictTier;
             *input.AddTiers() = deleteTier;
-            ValidateGetExpireAfter(input, true, TDuration::Seconds(3600));
-            ValidateGetExpireAfter(input, false, TConclusionStatus::Fail("Only DELETE via TTL is allowed for row-oriented tables"));
+            ValidateGetExpireAfter(input, true, TDuration::Seconds(1800));
+            ValidateGetExpireAfter(input, false, TConclusionStatus::Fail("Only DELETE or ObjectStorage eviction"));
         }
         {
             NKikimrSchemeOp::TTTLSettings::TEnabled input;
             *input.AddTiers() = evictTier;
-            ValidateGetExpireAfter(input, true, TConclusionStatus::Fail("TTL settings does not contain DELETE action"));
-            ValidateGetExpireAfter(input, false, TConclusionStatus::Fail("Only DELETE via TTL is allowed for row-oriented tables"));
+            ValidateGetExpireAfter(input, true, TDuration::Seconds(1800));
+            ValidateGetExpireAfter(input, false, TConclusionStatus::Fail("Only DELETE or ObjectStorage eviction"));
         }
+    }
+
+    Y_UNIT_TEST(RowEvictionProtocolRoundTrip) {
+        NKikimrTxDataShard::TEvConditionalEraseRowsRequest request;
+        request.SetTableId(42);
+        request.MutableEviction()->SetStoragePath("/Root/Tier");
+        auto* settings = request.MutableEviction()->MutableObjectStorage();
+        settings->SetEndpoint("s3.example/batches");
+        settings->SetBucket("ttl");
+        settings->SetAccessKey("SId:access-key");
+        settings->SetSecretKey("SId:secret-key");
+
+        NKikimrTxDataShard::TEvConditionalEraseRowsRequest copy;
+        UNIT_ASSERT(copy.ParseFromString(request.SerializeAsString()));
+        UNIT_ASSERT_VALUES_EQUAL(copy.GetEviction().GetStoragePath(), "/Root/Tier");
+        UNIT_ASSERT_VALUES_EQUAL(copy.GetEviction().GetObjectStorage().GetBucket(), "ttl");
+        UNIT_ASSERT_VALUES_EQUAL(copy.GetEviction().GetObjectStorage().GetAccessKey(), "SId:access-key");
+
+        NKikimrTxDataShard::TRowTtlEvictionBatch batch;
+        batch.SetOwnerId(1);
+        batch.SetTableId(42);
+        batch.SetTabletId(100500);
+        batch.AddColumnIds(1);
+        batch.AddColumnIds(2);
+        batch.AddRows("opaque-cell-vector");
+
+        NKikimrTxDataShard::TRowTtlEvictionBatch batchCopy;
+        UNIT_ASSERT(batchCopy.ParseFromString(batch.SerializeAsString()));
+        UNIT_ASSERT_VALUES_EQUAL(batchCopy.ColumnIdsSize(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(batchCopy.GetRows(0), "opaque-cell-vector");
     }
 }

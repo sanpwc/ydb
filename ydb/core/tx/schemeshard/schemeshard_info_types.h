@@ -4507,6 +4507,10 @@ bool ValidateTtlSettings(const NKikimrSchemeOp::TTTLSettings& ttl,
     const THashMap<TString, ui32>& colName2Id,
     const TSubDomainInfo& subDomain, TString& errStr);
 
+class TSchemeShard;
+bool ValidateRowTtlExternalStorage(const NKikimrSchemeOp::TTTLSettings& ttl,
+    TSchemeShard* schemeShard, TString& errStr);
+
 /**
  * Check if the given detailed metrics settings (for a table) are valid.
  *

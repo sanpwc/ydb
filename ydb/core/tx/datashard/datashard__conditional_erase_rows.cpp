@@ -6,7 +6,13 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/tablet_flat/flat_row_state.h>
 #include <ydb/core/protos/datashard_config.pb.h>
+#include <ydb/core/wrappers/abstract.h>
+#include <ydb/core/wrappers/s3_wrapper.h>
+#include <ydb/services/metadata/secret/accessor/secret_id.h>
+#include <ydb/services/scheme_secret/resolver.h>
 
+#include <contrib/libs/aws-sdk-cpp/aws-cpp-sdk-s3/include/aws/s3/model/PutObjectRequest.h>
+#include <library/cpp/digest/md5/md5.h>
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 #include <util/generic/vector.h>
@@ -21,6 +27,15 @@ using namespace NActors;
 using namespace NTable;
 
 using TLimits = NKikimrTxDataShard::TEvConditionalEraseRowsRequest::TLimits;
+using TEvictionSettings = NKikimrTxDataShard::TEvConditionalEraseRowsRequest::TEvictionSettings;
+
+struct TEvTtlSecretsResolved : TEventLocal<TEvTtlSecretsResolved, TEvents::ES_PRIVATE + 0x6f01> {
+    NKqp::TEvDescribeSecretsResponse::TDescription Description;
+
+    explicit TEvTtlSecretsResolved(NKqp::TEvDescribeSecretsResponse::TDescription description)
+        : Description(std::move(description))
+    {}
+};
 
 class IEraserOps {
 protected:
@@ -53,18 +68,24 @@ class TCondEraseScan: public IActorCallback, public IActorExceptionHandler, publ
         {
         }
 
-        void Add(TString key) {
-            Size += key.size();
+        void Add(TString key, TString row = {}) {
+            Size += key.size() + row.size();
             Keys.emplace_back(std::move(key));
+            Rows.emplace_back(std::move(row));
         }
 
         void Clear() {
             Keys.clear();
+            Rows.clear();
             Size = 0;
         }
 
         TVector<TString>& GetKeys() {
             return Keys;
+        }
+
+        const TVector<TString>& GetRows() const {
+            return Rows;
         }
 
         ui32 Count() const {
@@ -99,6 +120,7 @@ class TCondEraseScan: public IActorCallback, public IActorExceptionHandler, publ
         const ui32 MaxCount;
 
         TVector<TString> Keys;
+        TVector<TString> Rows;
         ui32 Size;
     };
 
@@ -118,9 +140,9 @@ class TCondEraseScan: public IActorCallback, public IActorExceptionHandler, publ
             *MonProcessed += 1;
         }
 
-        void IncErased() {
-            ++RowsErased;
-            *MonErased += 1;
+        void IncErased(ui64 count) {
+            RowsErased += count;
+            *MonErased += count;
         }
 
         void ToProto(NKikimrTxDataShard::TEvConditionalEraseRowsResponse::TStats& stats) const {
@@ -170,8 +192,38 @@ class TCondEraseScan: public IActorCallback, public IActorExceptionHandler, publ
     }
 
     void SendEraseRowsRequest() {
+        PendingEraseCount = SerializedKeys.Count();
         Send(CreateEraser(), MakeEraseRowsRequest(TableId, Condition.Get(), KeyOrder, SerializedKeys.GetKeys()));
         SerializedKeys.Clear();
+    }
+
+    void SendBatch() {
+        if (!Eviction) {
+            SendEraseRowsRequest();
+            return;
+        }
+
+        NKikimrTxDataShard::TRowTtlEvictionBatch batch;
+        batch.SetOwnerId(TableId.PathId.OwnerId);
+        batch.SetTableId(TableId.PathId.LocalPathId);
+        batch.SetSchemaVersion(TableId.SchemaVersion);
+        batch.SetTabletId(DataShard.TabletId);
+        for (const TTag tag : RowTags) {
+            batch.AddColumnIds(tag);
+        }
+        for (const TString& row : SerializedKeys.GetRows()) {
+            batch.AddRows(row);
+        }
+
+        TString body;
+        Y_ENSURE(batch.SerializeToString(&body));
+        const TString objectKey = TStringBuilder()
+            << "ttl/" << TableId.PathId.OwnerId
+            << "/" << TableId.PathId.LocalPathId
+            << "/" << DataShard.TabletId
+            << "/" << MD5::Calc(body) << ".pb";
+        auto request = Aws::S3::Model::PutObjectRequest().WithKey(objectKey.c_str());
+        Send(StorageWrapper, new NWrappers::TEvExternalStorage::TEvPutObjectRequest(request, std::move(body)));
     }
 
     void Reply(EStatus status = EStatus::Done) {
@@ -201,6 +253,10 @@ class TCondEraseScan: public IActorCallback, public IActorExceptionHandler, publ
 
         Success = (record.GetStatus() == NKikimrTxDataShard::TEvEraseRowsResponse::OK);
         Error = record.GetErrorDescription();
+        if (Success) {
+            Stats.IncErased(PendingEraseCount);
+        }
+        PendingEraseCount = 0;
 
         CloseEraser();
 
@@ -217,10 +273,45 @@ class TCondEraseScan: public IActorCallback, public IActorExceptionHandler, publ
         Reply();
     }
 
+    void Handle(NWrappers::TEvExternalStorage::TEvPutObjectResponse::TPtr& ev) {
+        const auto& result = ev->Get()->Result;
+        if (!result.IsSuccess()) {
+            Success = false;
+            Error = TStringBuilder() << "TTL ObjectStorage upload failed: " << result.GetError().GetMessage();
+            SerializedKeys.Clear();
+            Driver->Touch(EScan::Final);
+            return;
+        }
+        SendEraseRowsRequest();
+    }
+
+    void Handle(TEvTtlSecretsResolved::TPtr& ev) {
+        if (ev->Get()->Description.Status != Ydb::StatusIds::SUCCESS
+            || ev->Get()->Description.SecretValues.size() != 2) {
+            Success = false;
+            if (ev->Get()->Description.Status == Ydb::StatusIds::SUCCESS) {
+                Error = "TTL ObjectStorage secret resolver returned an unexpected number of values";
+            } else {
+                Error = TStringBuilder() << "TTL ObjectStorage secret resolution failed: "
+                    << ev->Get()->Description.Issues.ToOneLineString();
+            }
+            Driver->Touch(EScan::Final);
+            return;
+        }
+
+        auto settings = Eviction->GetObjectStorage();
+        settings.SetAccessKey(ev->Get()->Description.SecretValues[0]);
+        settings.SetSecretKey(ev->Get()->Description.SecretValues[1]);
+        auto config = NWrappers::IExternalStorageConfig::Construct(AppData()->AwsClientConfig, settings);
+        StorageWrapper = Register(NWrappers::CreateStorageWrapper(config->ConstructStorageOperator()));
+        Driver->Touch(EScan::Feed);
+    }
+
 public:
     explicit TCondEraseScan(TDataShard* ds, const TActorId& replyTo,
         const TString& databaseName, const TTableId& tableId, ui64 txId,
-        THolder<IEraseRowsCondition> condition, const TLimits& limits
+        THolder<IEraseRowsCondition> condition, const TLimits& limits,
+        std::optional<TEvictionSettings> eviction = std::nullopt
     )
         : IActorCallback(static_cast<TReceiveFunc>(&TCondEraseScan::StateWork), NKikimrServices::TActivity::CONDITIONAL_ERASE_ROWS_SCAN_ACTOR)
         , DatabaseName(databaseName)
@@ -231,6 +322,7 @@ public:
         , Condition(std::move(condition))
         , Driver(nullptr)
         , SerializedKeys(limits.GetBatchMaxBytes(), limits.GetBatchMinKeys(), limits.GetBatchMaxKeys())
+        , Eviction(std::move(eviction))
         , NoMoreData(false)
         , Success(true)
     {
@@ -270,9 +362,48 @@ public:
             key.Pos = it->second;
         }
 
+        if (Eviction) {
+            for (const auto& col : Scheme->Cols) {
+                if (!tagToPos.contains(col.Tag)) {
+                    tagToPos.emplace(col.Tag, ScanTags.size());
+                    ScanTags.push_back(col.Tag);
+                }
+                RowTags.push_back(col.Tag);
+                RowPositions.push_back(tagToPos.at(col.Tag));
+            }
+        }
+
         Condition->Prepare(Scheme, 0);
 
-        return {EScan::Feed, {}};
+        if (!Eviction) {
+            return {EScan::Feed, {}};
+        }
+
+        const auto& settings = Eviction->GetObjectStorage();
+        const auto accessKey = NMetadata::NSecret::TSecretIdOrValue::DeserializeFromString(settings.GetAccessKey());
+        const auto secretKey = NMetadata::NSecret::TSecretIdOrValue::DeserializeFromString(settings.GetSecretKey());
+        Y_ENSURE(accessKey && secretKey, "Malformed ObjectStorage credential reference");
+
+        TVector<TString> secretNames;
+        for (const auto* value : {&*accessKey, &*secretKey}) {
+            const TString serialized = value->SerializeToString();
+            Y_ENSURE(serialized.StartsWith(NMetadata::NSecret::TSecretName::PrefixNoUser),
+                "Row TTL ObjectStorage credentials must be schema secret names");
+            secretNames.push_back(serialized.substr(NMetadata::NSecret::TSecretName::PrefixNoUser.size()));
+        }
+
+        auto promise = NThreading::NewPromise<NKqp::TEvDescribeSecretsResponse::TDescription>();
+        auto future = promise.GetFuture();
+        const TActorId selfId = SelfId();
+        future.Subscribe([actorSystem = TlsActivationContext->ActorSystem(), selfId](const auto& result) {
+            actorSystem->Send(selfId, new TEvTtlSecretsResolved(result.GetValue()));
+        });
+        Send(NSecret::MakeDescribeSchemaSecretServiceId(SelfId().NodeId()), new NSecret::TEvResolveSecret(
+            MakeIntrusive<NACLib::TUserToken>(BUILTIN_ACL_METADATA, TVector<NACLib::TSID>{}),
+            DatabaseName,
+            std::move(secretNames),
+            std::move(promise)));
+        return {EScan::Sleep, {}};
     }
 
     void Registered(TActorSystem* sys, const TActorId&) override {
@@ -290,13 +421,19 @@ public:
             return EScan::Feed;
         }
 
-        Stats.IncErased();
-        SerializedKeys.Add(TSerializedCellVec::Serialize(MakeKeyCells(KeyOrder, row)));
+        TVector<TCell> rowCells;
+        rowCells.reserve(RowPositions.size());
+        for (const TPos pos : RowPositions) {
+            rowCells.push_back(row.Get(pos));
+        }
+        SerializedKeys.Add(
+            TSerializedCellVec::Serialize(MakeKeyCells(KeyOrder, row)),
+            Eviction ? TSerializedCellVec::Serialize(rowCells) : TString());
         if (SerializedKeys.CheckLimits()) {
             return EScan::Feed;
         }
 
-        SendEraseRowsRequest();
+        SendBatch();
         return EScan::Sleep;
     }
 
@@ -307,7 +444,7 @@ public:
             return EScan::Final;
         }
 
-        SendEraseRowsRequest();
+        SendBatch();
         return EScan::Sleep;
     }
 
@@ -328,6 +465,9 @@ public:
 
     void PassAway() override {
         CloseEraser();
+        if (StorageWrapper) {
+            Send(std::exchange(StorageWrapper, TActorId()), new TEvents::TEvPoisonPill());
+        }
         IActor::PassAway();
     }
 
@@ -335,6 +475,8 @@ public:
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvDataShard::TEvEraseRowsResponse, Handle);
             hFunc(TEvDataShard::TEvConditionalEraseRowsRequest, Handle);
+            hFunc(NWrappers::TEvExternalStorage::TEvPutObjectResponse, Handle);
+            hFunc(TEvTtlSecretsResolved, Handle);
         }
     }
 
@@ -379,7 +521,12 @@ private:
     TIntrusiveConstPtr<TScheme> Scheme;
     TVector<TKey> KeyOrder;
     TVector<TTag> ScanTags;
+    TVector<TTag> RowTags;
+    TVector<TPos> RowPositions;
     TSerializedKeys SerializedKeys;
+    std::optional<TEvictionSettings> Eviction;
+    TActorId StorageWrapper;
+    ui64 PendingEraseCount = 0;
 
     TStats Stats;
     bool NoMoreData;
@@ -393,8 +540,9 @@ public:
     explicit TIndexedCondEraseScan(
             TDataShard* ds, const TActorId& replyTo,
             const TString& databaseName, const TTableId& tableId, ui64 txId,
-            THolder<IEraseRowsCondition> condition, const TLimits& limits, TIndexes indexes)
-        : TCondEraseScan(ds, replyTo, databaseName, tableId, txId, std::move(condition), limits)
+            THolder<IEraseRowsCondition> condition, const TLimits& limits, TIndexes indexes,
+            std::optional<TEvictionSettings> eviction)
+        : TCondEraseScan(ds, replyTo, databaseName, tableId, txId, std::move(condition), limits, std::move(eviction))
         , Indexes(std::move(indexes))
     {
     }
@@ -452,15 +600,17 @@ private:
 
 IScan* CreateCondEraseScan(
         TDataShard* ds, const TActorId& replyTo, const TString& databaseName, const TTableId& tableId, ui64 txId,
-        THolder<IEraseRowsCondition> condition, const TLimits& limits, TIndexes indexes)
+        THolder<IEraseRowsCondition> condition, const TLimits& limits, TIndexes indexes,
+        std::optional<TEvictionSettings> eviction)
 {
     Y_ENSURE(ds);
     Y_ENSURE(condition.Get());
 
     if (!indexes) {
-        return new TCondEraseScan(ds, replyTo, databaseName, tableId, txId, std::move(condition), limits);
+        return new TCondEraseScan(ds, replyTo, databaseName, tableId, txId, std::move(condition), limits, std::move(eviction));
     } else {
-        return new TIndexedCondEraseScan(ds, replyTo, databaseName, tableId, txId, std::move(condition), limits, std::move(indexes));
+        return new TIndexedCondEraseScan(ds, replyTo, databaseName, tableId, txId, std::move(condition), limits,
+            std::move(indexes), std::move(eviction));
     }
 }
 
@@ -599,8 +749,16 @@ void TDataShard::Handle(TEvDataShard::TEvConditionalEraseRowsRequest::TPtr& ev, 
                     if (CheckUnit(column->second.Type, record.GetExpiration().GetColumnUnit(), error)) {
                         localTxId = NextTieBreakerIndex++;
                         const auto tableId = TTableId(PathOwnerId, localPathId, record.GetSchemaVersion());
+                        std::optional<TEvictionSettings> eviction;
+                        if (record.HasEviction()) {
+                            if (!record.GetEviction().HasObjectStorage()) {
+                                badRequest("Row TTL eviction request does not contain ObjectStorage settings");
+                                break;
+                            }
+                            eviction = record.GetEviction();
+                        }
                         scan.Reset(CreateCondEraseScan(this, ev->Sender, record.GetDatabaseName(), tableId, localTxId,
-                            THolder(CreateEraseRowsCondition(record)), record.GetLimits(), GetIndexes(record)));
+                            THolder(CreateEraseRowsCondition(record)), record.GetLimits(), GetIndexes(record), std::move(eviction)));
                     } else {
                         badRequest(error);
                     }

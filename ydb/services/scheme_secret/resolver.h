@@ -14,8 +14,41 @@
 
 namespace NKikimr::NSecret {
 
+inline NActors::TActorId MakeDescribeSchemaSecretServiceId(ui32 nodeId) {
+    const char name[12] = "kqp_dsc_sec";
+    return NActors::TActorId(nodeId, TStringBuf(name, 12));
+}
+
 struct TDescribeSecretSettings {
     IRetryPolicy<>::TPtr RetryPolicy;
+};
+
+struct TEvResolveSecret : public NActors::TEventLocal<TEvResolveSecret,
+        EventSpaceBegin(TKikimrEvents::ES_PRIVATE)> {
+    TEvResolveSecret(
+        TIntrusiveConstPtr<NACLib::TUserToken> userToken,
+        TString database,
+        TVector<TString> secretNames,
+        NThreading::TPromise<NKqp::TEvDescribeSecretsResponse::TDescription> promise,
+        TDescribeSecretSettings settings = {})
+        : UserToken(std::move(userToken))
+        , Database(std::move(database))
+        , SecretNames(std::move(secretNames))
+        , Promise(std::move(promise))
+        , Settings(std::move(settings))
+    {
+        Y_ENSURE(!Database.empty(), "Database name must be set in secret requests");
+    }
+
+    THolder<TEvResolveSecret> MakeCopy() const {
+        return MakeHolder<TEvResolveSecret>(UserToken, Database, SecretNames, Promise, Settings);
+    }
+
+    const TIntrusiveConstPtr<NACLib::TUserToken> UserToken;
+    const TString Database;
+    const TVector<TString> SecretNames;
+    NThreading::TPromise<NKqp::TEvDescribeSecretsResponse::TDescription> Promise;
+    const TDescribeSecretSettings Settings;
 };
 
 IRetryPolicy<>::TPtr MakeShortRetryPolicy();

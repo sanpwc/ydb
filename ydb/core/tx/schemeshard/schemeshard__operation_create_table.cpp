@@ -651,6 +651,10 @@ public:
             result->SetError(NKikimrScheme::StatusSchemeError, errStr);
             return result;
         }
+        if (schema.HasTTLSettings() && !ValidateRowTtlExternalStorage(schema.GetTTLSettings(), context.SS, errStr)) {
+            result->SetError(NKikimrScheme::StatusSchemeError, errStr);
+            return result;
+        }
 
         TTableInfo::TPtr tableInfo = new TTableInfo(std::move(*alterData));
         alterData.Reset();

@@ -12,6 +12,7 @@ import "ydb/library/formats/arrow/protos/ssa.proto";
 import "ydb/core/protos/tablet.proto";
 import "ydb/core/protos/tx.proto";
 import "ydb/core/protos/flat_scheme_op.proto";
+import "ydb/core/protos/s3_settings.proto";
 import "ydb/core/protos/table_stats.proto";
 import "ydb/core/protos/subdomains.proto";
 import "ydb/core/protos/sys_view_types.proto";
@@ -1521,15 +1522,33 @@ message TEvConditionalEraseRowsRequest {
         optional uint32 BatchMaxKeys = 3 [default = 50000];
     };
 
+    message TEvictionSettings {
+        optional string StoragePath = 1;
+        optional NKikimrSchemeOp.TS3Settings ObjectStorage = 2;
+    };
+
     optional uint64 TableId = 1;
     optional uint64 SchemaVersion = 3;
     repeated TIndexDescription Indexes = 4;
     optional TLimits Limits = 5;
     optional string DatabaseName = 6;
+    optional TEvictionSettings Eviction = 7;
 
     oneof Condition {
         TExpirationCondition Expiration = 2;
     }
+}
+
+// Stable wire format uploaded by row-table TTL eviction. It deliberately
+// contains opaque cell vectors rather than a reader-facing table format: the
+// MVP guarantees durable transfer-before-erase, not transparent reads.
+message TRowTtlEvictionBatch {
+    optional uint64 OwnerId = 1;
+    optional uint64 TableId = 2;
+    optional uint64 SchemaVersion = 3;
+    optional uint64 TabletId = 4;
+    repeated uint32 ColumnIds = 5;
+    repeated bytes Rows = 6; // TSerializedCellVec in ColumnIds order
 }
 
 message TEvConditionalEraseRowsResponse {

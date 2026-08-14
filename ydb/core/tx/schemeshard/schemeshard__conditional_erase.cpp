@@ -4,6 +4,7 @@
 #include <util/string/join.h>
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/protos/flat_scheme_op.pb.h>
+#include <ydb/core/tx/tiering/tier/object.h>
 
 namespace NKikimr {
 namespace NSchemeShard {
@@ -212,6 +213,37 @@ struct TSchemeShard::TTxRunConditionalErase: public TSchemeShard::TRwTxBase {
         request.MutableExpiration()->SetColumnId(tableInfo->GetTTLColumnId());
         request.MutableExpiration()->SetWallClockTimestamp(wallClock.GetValue());
         request.MutableExpiration()->SetColumnUnit(settings.GetColumnUnit());
+
+        if (settings.TiersSize() == 1 && settings.GetTiers(0).HasEvictToExternalStorage()) {
+            const TString& storagePath = settings.GetTiers(0).GetEvictToExternalStorage().GetStorage();
+            TPath path = TPath::Resolve(storagePath, Self);
+            if (!path.IsResolved() || path.IsDeleted() || path.IsUnderDeleting() || !path->IsExternalDataSource()) {
+                LOG_WARN_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                    "Cannot resolve row TTL external data source at request construction"
+                    << ", storage: " << storagePath << logContext(now));
+                return false;
+            }
+            auto* source = Self->ExternalDataSources.FindPtr(path->PathId);
+            if (!source) {
+                LOG_WARN_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                    "Missing row TTL external data source at request construction"
+                    << ", storage: " << storagePath << logContext(now));
+                return false;
+            }
+
+            NKikimrSchemeOp::TExternalDataSourceDescription description;
+            (*source)->FillProto(description, false);
+            NColumnShard::NTiers::TTierConfig tierConfig;
+            if (auto status = tierConfig.DeserializeFromProto(description); status.IsFail()) {
+                LOG_WARN_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+                    "Invalid row TTL external data source at request construction"
+                    << ", storage: " << storagePath
+                    << ", error: " << status.GetErrorMessage() << logContext(now));
+                return false;
+            }
+            request.MutableEviction()->SetStoragePath(storagePath);
+            request.MutableEviction()->MutableObjectStorage()->CopyFrom(tierConfig.GetProtoConfig());
+        }
 
         const auto& sysSettings = settings.GetSysSettings();
         request.MutableLimits()->SetBatchMaxBytes(sysSettings.GetBatchMaxBytes());

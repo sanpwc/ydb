@@ -262,6 +262,10 @@ TTableInfo::TAlterDataPtr ParseParams(const TPath& path, TTableInfo::TPtr table,
         status = NKikimrScheme::StatusInvalidParameter;
         return nullptr;
     }
+    if (copyAlter.HasTTLSettings() && !ValidateRowTtlExternalStorage(copyAlter.GetTTLSettings(), context.SS, errStr)) {
+        status = NKikimrScheme::StatusInvalidParameter;
+        return nullptr;
+    }
 
     return alterData;
 }

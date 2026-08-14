@@ -1,7 +1,9 @@
 #include "common/validation.h"
+#include "schemeshard_impl.h"
 #include "schemeshard_info_types.h"
 
 #include <ydb/core/protos/flat_scheme_op.pb.h>
+#include <ydb/core/tx/tiering/tier/object.h>
 
 namespace NKikimr {
 namespace NSchemeShard {
@@ -60,7 +62,7 @@ bool ValidateTtlSettings(const NKikimrSchemeOp::TTTLSettings& ttl,
             return false;
         }
 
-        const auto expireAfter = GetExpireAfter(enabled, false);
+        const auto expireAfter = GetExpireAfter(enabled, true);
         if (expireAfter.IsFail()) {
             errStr = expireAfter.GetErrorMessage();
             return false;
@@ -93,16 +95,60 @@ bool ValidateTtlSettings(const NKikimrSchemeOp::TTTLSettings& ttl,
     return true;
 }
 
+bool ValidateRowTtlExternalStorage(const NKikimrSchemeOp::TTTLSettings& ttl,
+        TSchemeShard* schemeShard, TString& errStr) {
+    if (!ttl.HasEnabled()) {
+        return true;
+    }
+
+    const auto& tiers = ttl.GetEnabled().GetTiers();
+    if (tiers.empty() || tiers.size() == 1 && tiers.Get(0).HasDelete()) {
+        return true;
+    }
+    if (tiers.size() != 1 || !tiers.Get(0).HasEvictToExternalStorage()) {
+        errStr = "Row-oriented TTL supports either DELETE or exactly one eviction tier";
+        return false;
+    }
+
+    const TString& storagePath = tiers.Get(0).GetEvictToExternalStorage().GetStorage();
+    TPath path = TPath::Resolve(storagePath, schemeShard);
+    if (!path.IsResolved() || path.IsDeleted() || path.IsUnderDeleting()) {
+        errStr = "TTL external data source not found: " + storagePath;
+        return false;
+    }
+    if (!path->IsExternalDataSource()) {
+        errStr = "TTL eviction target is not an external data source: " + storagePath;
+        return false;
+    }
+
+    auto* source = schemeShard->ExternalDataSources.FindPtr(path->PathId);
+    if (!source) {
+        errStr = "Cannot resolve TTL external data source: " + storagePath;
+        return false;
+    }
+
+    NKikimrSchemeOp::TExternalDataSourceDescription description;
+    (*source)->FillProto(description, false);
+    if (description.GetSourceType() != "ObjectStorage") {
+        errStr = "Row-oriented TTL eviction supports only ObjectStorage external data sources";
+        return false;
+    }
+
+    NColumnShard::NTiers::TTierConfig config;
+    if (auto status = config.DeserializeFromProto(description); status.IsFail()) {
+        errStr = "Cannot use external data source for row-oriented TTL eviction: " + status.GetErrorMessage();
+        return false;
+    }
+    return true;
+}
+
 TConclusion<TDuration> GetExpireAfter(const NKikimrSchemeOp::TTTLSettings::TEnabled& settings, const bool allowNonDeleteTiers) {
     if (settings.TiersSize()) {
-        for (const auto& tier : settings.GetTiers()) {
-            if (tier.HasDelete()) {
-                return TDuration::Seconds(tier.GetApplyAfterSeconds());
-            } else if (!allowNonDeleteTiers) {
-                return TConclusionStatus::Fail("Only DELETE via TTL is allowed for row-oriented tables");
-            }
+        const auto& tier = settings.GetTiers(0);
+        if (tier.HasDelete() || allowNonDeleteTiers && tier.HasEvictToExternalStorage()) {
+            return TDuration::Seconds(tier.GetApplyAfterSeconds());
         }
-        return TConclusionStatus::Fail("TTL settings does not contain DELETE action");
+        return TConclusionStatus::Fail("Only DELETE or ObjectStorage eviction via TTL is allowed for row-oriented tables");
     } else {
         // legacy format
         return TDuration::Seconds(settings.GetExpireAfterSeconds());

@@ -1921,7 +1921,36 @@ Y_UNIT_TEST_SUITE(TSchemeShardTTLTests) {
                 }
               }
             }
-        )", {{NKikimrScheme::StatusInvalidParameter, "Only DELETE via TTL is allowed for row-oriented tables"}});
+        )", {{NKikimrScheme::StatusInvalidParameter, "exactly one eviction tier"}});
+
+        TestCreateExternalDataSource(runtime, ++txId, "/MyRoot", R"(
+            Name: "RowTtlTier"
+            SourceType: "ObjectStorage"
+            Location: "https://s3.example/ttl"
+            Auth {
+                Aws {
+                    AwsAccessKeyIdSecretName: "row-ttl-access"
+                    AwsSecretAccessKeySecretName: "row-ttl-secret"
+                }
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TestAlterTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "TTLEnabledTable"
+            TTLSettings {
+              Enabled {
+                ColumnName: "modified_at"
+                Tiers {
+                    EvictToExternalStorage {
+                        Storage: "/MyRoot/RowTtlTier"
+                    }
+                    ApplyAfterSeconds: 3600
+                }
+              }
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
     }
 }
 
