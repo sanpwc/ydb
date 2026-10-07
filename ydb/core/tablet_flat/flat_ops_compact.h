@@ -122,8 +122,8 @@ namespace NTabletFlatExecutor {
 
             // Deltas
             struct TDelta { TCompactDeltaKey Key; TSavedRow Row; };
+            // Deltas in the order they must be written
             TVector<TDelta> SavedDeltas;
-            TVector<TCompactDeltaKey> SavedDeltaOrder;
 
             // Committed versions (descending order)
             struct TVersion {
@@ -247,7 +247,6 @@ namespace NTabletFlatExecutor {
                     d.Key = key;
                     d.Row.Save(it->second);
                 }
-                FtCurKey.SavedDeltaOrder = TVector<TCompactDeltaKey>(DeltasOrder.begin(), DeltasOrder.end());
                 Deltas.clear();
                 DeltasOrder.clear();
             }
@@ -339,15 +338,10 @@ namespace NTabletFlatExecutor {
                 Writer->AddKeyLock(key.LockMode, key.LockTxId);
             }
 
-            for (const auto& deltaKey : key.SavedDeltaOrder) {
-                for (const auto& d : key.SavedDeltas) {
-                    if (d.Key == deltaKey) {
-                        NTable::TRowState rs;
-                        d.Row.Restore(rs);
-                        Writer->AddKeyDelta(rs, deltaKey.first, deltaKey.second);
-                        break;
-                    }
-                }
+            for (const auto& d : key.SavedDeltas) {
+                NTable::TRowState rs;
+                d.Row.Restore(rs);
+                Writer->AddKeyDelta(rs, d.Key.first, d.Key.second);
             }
 
             for (const auto& v : key.Versions) {
@@ -803,7 +797,29 @@ namespace NTabletFlatExecutor {
                 }
             }
 
-            if (status.empty()) {
+            NTable::TRemovedTxOps removedOps;
+            auto mergeRemovedOps = [&](ui64 txId, ui32 from, ui32 to) {
+                if (Conf->GarbageRemovedTxOps.Contains(txId)) {
+                    // We don't write removed operations of transactions without data
+                    return;
+                }
+                removedOps[txId].Add(from, to);
+            };
+
+            for (const auto& memTable : Conf->Frozen) {
+                for (const auto& pr : memTable->GetRemovedTxOps()) {
+                    for (const auto& range : pr.second.GetRanges()) {
+                        mergeRemovedOps(pr.first, range.From, range.To);
+                    }
+                }
+            }
+            for (const auto& txStatus : Conf->TxStatus) {
+                for (const auto& item : txStatus->TxStatusPage->GetRemovedOpsItems()) {
+                    mergeRemovedOps(item.GetTxId(), item.GetFrom(), item.GetTo());
+                }
+            }
+
+            if (status.empty() && removedOps.empty()) {
                 // Nothing to write
                 return;
             }
@@ -815,6 +831,9 @@ namespace NTabletFlatExecutor {
                 } else {
                     builder.AddRemoved(pr.first);
                 }
+            }
+            for (const auto& pr : removedOps) {
+                builder.AddRemovedOps(pr.first, pr.second);
             }
 
             auto data = builder.Finish();
