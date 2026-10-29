@@ -25,12 +25,27 @@ namespace NTabletFlatExecutor {
     struct TCompactCfg final : public IDestructable {
         using TConf = NTable::NPage::TConf;
 
+        // Configuration for a single compaction output
+        struct TOutputConf {
+            NTable::NPage::TConf Layout;
+            NWriter::TConf Writer;
+            ui32 OutputId = 0;
+            bool KeepInCache = false;  // Cache mode for this output
+            bool Final = false;         // Is this output final (no keys below)
+            NTable::NPage::IKeySpace* UnderlayMask = nullptr;  // Mask for keys that may exist below
+        };
+
         explicit TCompactCfg(THolder<NTable::TCompactionParams> params)
             : Params(std::move(params))
         {
         }
 
         NTable::TEpoch Epoch = NTable::TEpoch::Zero();   /* Result epoch of compacted part */
+        
+        // Multiple compaction outputs (step 1.4.1)
+        TVector<TOutputConf> Outputs;
+        
+        // Legacy single output configuration (deprecated, for backward compatibility)
         NTable::NPage::TConf Layout;
         NWriter::TConf Writer;
         NKikimrBlobStorage::TDataKind::E DataKind = NKikimrBlobStorage::TDataKind::USER;
