@@ -19,6 +19,9 @@ SRCS(
     flat_executor_database_ut.cpp
     flat_executor_gclogic_ut.cpp
     flat_executor_leases_ut.cpp
+    flat_executor_tiering_caps_ut.cpp
+    flat_executor_tiering_concurrency_ut.cpp
+    flat_executor_tiering_versions_ut.cpp
     flat_range_cache_ut.cpp
     flat_row_versions_ut.cpp
     flat_table_part_ut.cpp
@@ -40,6 +43,11 @@ SRCS(
     ut_stat.cpp
     ut_comp_gen.cpp
     ut_compaction.cpp
+    ut_compaction_context.cpp
+    ut_compaction_levels.cpp
+    ut_compaction_logic.cpp
+    ut_compaction_router.cpp
+    ut_compaction_tiering.cpp
     ut_compaction_outputs.cpp
     ut_compaction_fulltext.cpp
     ut_compaction_multi.cpp
@@ -68,6 +76,7 @@ SRCS(
     ut_vacuum.cpp
     ut_versions.cpp
     ut_scan_delta.cpp
+    ut_scan_source.cpp
     ut_backup.cpp
 )
 

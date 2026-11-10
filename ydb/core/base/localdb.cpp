@@ -73,6 +73,7 @@ TCompactionPolicy::TGenerationPolicy::TGenerationPolicy(const NKikimrCompaction:
     , ExtraCompactionMinSize(policyPb.HasExtraCompactionMinSize() ? policyPb.GetExtraCompactionMinSize() : 16384)
     , ExtraCompactionExpMaxSize(policyPb.HasExtraCompactionExpMaxSize() ? policyPb.GetExtraCompactionExpMaxSize() : SizeToCompact / CountToCompact)
     , UpliftPartSize(policyPb.HasUpliftPartSize() ? policyPb.GetUpliftPartSize() : SizeToCompact / CountToCompact)
+    , TierId(policyPb.HasTierId() ? std::make_optional(policyPb.GetTierId()) : std::nullopt)
 {
     if (!ResourceBrokerTask)
         ResourceBrokerTask = LegacyQueueIdToTaskName(CompactionBrokerQueue);
@@ -93,6 +94,11 @@ void TCompactionPolicy::TGenerationPolicy::Serialize(NKikimrCompaction::TCompact
     policyPb.SetExtraCompactionExpPercent(ExtraCompactionExpPercent);
     policyPb.SetExtraCompactionExpMaxSize(ExtraCompactionExpMaxSize);
     policyPb.SetUpliftPartSize(UpliftPartSize);
+    if (TierId) {
+        policyPb.SetTierId(*TierId);
+    } else {
+        policyPb.ClearTierId();
+    }
 }
 
 TCompactionPolicy::TCompactionPolicy()
@@ -118,6 +124,7 @@ TCompactionPolicy::TCompactionPolicy()
     , DroppedRowsPercentToCompact(50)
     , CompactionStrategy(NKikimrCompaction::CompactionStrategyUnset)
     , KeepEraseMarkers(false)
+    , TieringCompactionConflictLimit(5)
 {}
 
 TCompactionPolicy::TCompactionPolicy(const NKikimrCompaction::TCompactionPolicy& policyPb)
@@ -143,6 +150,7 @@ TCompactionPolicy::TCompactionPolicy(const NKikimrCompaction::TCompactionPolicy&
     , DroppedRowsPercentToCompact(policyPb.HasDroppedRowsPercentToCompact() ? policyPb.GetDroppedRowsPercentToCompact() : 50)
     , CompactionStrategy(policyPb.GetCompactionStrategy())
     , KeepEraseMarkers(policyPb.HasKeepEraseMarkers() ? policyPb.GetKeepEraseMarkers() : false)
+    , TieringCompactionConflictLimit(policyPb.GetTieringCompactionConflictLimit())
 {
     if (!InMemResourceBrokerTask)
         InMemResourceBrokerTask = LegacyQueueIdToTaskName(InMemCompactionBrokerQueue);
@@ -182,6 +190,7 @@ void TCompactionPolicy::Serialize(NKikimrCompaction::TCompactionPolicy& policyPb
     policyPb.SetLogOverheadSizeToSnapshot(LogOverheadSizeToSnapshot);
     policyPb.SetLogOverheadCountToSnapshot(LogOverheadCountToSnapshot);
     policyPb.SetDroppedRowsPercentToCompact(DroppedRowsPercentToCompact);
+    policyPb.SetTieringCompactionConflictLimit(TieringCompactionConflictLimit);
     if (CompactionStrategy != NKikimrCompaction::CompactionStrategyUnset) {
         policyPb.SetCompactionStrategy(CompactionStrategy);
     }
@@ -216,13 +225,35 @@ TCompactionPolicyPtr CreateDefaultUserTablePolicy() {
     return userPolicy;
 }
 
+bool ValidateCompactionPolicy(const TCompactionPolicy& policy, TString& err) {
+    if (policy.TieringCompactionConflictLimit == 0) {
+        err = "TieringCompactionConflictLimit must be positive";
+        return false;
+    }
+    THashSet<ui32> seenTiers;
+    std::optional<ui32> previousTier;
+    for (size_t i = 0; i < policy.Generations.size(); ++i) {
+        const ui32 tierId = policy.Generations[i].TierId.value_or(0);
+        if (previousTier && *previousTier == tierId) {
+            continue;
+        }
+        if (!seenTiers.insert(tierId).second) {
+            err = Sprintf("Generation %u returns to tier %u: generations of each tier must form a contiguous block",
+                (ui32)i, tierId);
+            return false;
+        }
+        previousTier = tierId;
+    }
+    return true;
+}
+
 bool ValidateCompactionPolicyChange(const TCompactionPolicy& oldPolicy, const TCompactionPolicy& newPolicy, TString& err) {
     if (newPolicy.Generations.size() < oldPolicy.Generations.size()) {
         err = Sprintf("Decreasing number of levels in compaction policy in not supported, old level count %u, new level count %u",
            (ui32)oldPolicy.Generations.size(), (ui32)newPolicy.Generations.size());
         return false;
     }
-    return true;
+    return ValidateCompactionPolicy(newPolicy, err);
 }
 
 TString LegacyQueueIdToTaskName(ui32 id)

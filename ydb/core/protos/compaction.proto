@@ -38,6 +38,8 @@ message TCompactionPolicy {
         optional uint32 ExtraCompactionExpPercent = 12;
         optional uint64 ExtraCompactionExpMaxSize = 13;
         optional uint64 UpliftPartSize = 14;
+        // Family id of the storage tier. When omitted, the generation belongs to the default tier (family 0).
+        optional uint32 TierId = 15;
     }
 
     //NOTE: default values must be in sync with ydb/core/base/localdb.cpp, TShardPolicy
@@ -108,6 +110,9 @@ message TCompactionPolicy {
     optional bool KeepEraseMarkers = 22;
     optional uint32 MinBTreeIndexNodeSize = 23 [default = 7168];
     optional uint32 MinBTreeIndexNodeKeys = 24 [default = 6];
+    // Input conflicts before retrying a generation with exclusive TAC.
+    // Successful TAC resets the counter; regular compaction preserves it.
+    optional uint32 TieringCompactionConflictLimit = 25 [default = 5];
 
     repeated TGenerationPolicy Generation = 10;
 }
